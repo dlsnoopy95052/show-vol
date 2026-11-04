@@ -9,22 +9,80 @@ struct Vol: Identifiable {
     let total: Int64
     let free: Int64
     let internalDisk: Bool
+    let ident: String        // e.g. disk3s1
+    let container: String    // e.g. disk3 (APFS container or the disk itself)
+    let fs: String
     var used: Int64 { total - free }
 }
 
-func loadVolumes() -> [Vol] {
-    let keys: [URLResourceKey] = [.volumeNameKey, .volumeTotalCapacityKey,
-        .volumeAvailableCapacityKey, .volumeAvailableCapacityForImportantUsageKey, .volumeIsInternalKey, .volumeIsLocalKey]
+struct Device: Identifiable {
+    let id: String           // physical disk, e.g. disk1
+    let name: String
+    let size: Int64
+    let bus: String
+    let internalDisk: Bool
+    let solid: Bool?
+    var volumes: [Vol]
+    var icon: String {
+        if internalDisk { return "internaldrive" }
+        return bus == "USB" ? "externaldrive.badge.plus" : "externaldrive"
+    }
+    var kind: String { solid == true ? "SSD" : (solid == false ? "HDD" : "Disk") }
+}
+
+func diskutilInfo(_ target: String) -> [String: Any] {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/sbin/diskutil")
+    p.arguments = ["info", "-plist", target]
+    let pipe = Pipe()
+    p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return [:] }
+    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    return (try? PropertyListSerialization.propertyList(from: data, format: nil)) as? [String: Any] ?? [:]
+}
+
+func wholeDisk(_ ident: String) -> String {
+    // disk1s2 -> disk1
+    guard let r = ident.range(of: "s[0-9]+$", options: .regularExpression) else { return ident }
+    return String(ident[..<r.lowerBound])
+}
+
+func loadDevices() -> [Device] {
+    let keys: [URLResourceKey] = [.volumeNameKey, .volumeTotalCapacityKey, .volumeAvailableCapacityKey,
+        .volumeAvailableCapacityForImportantUsageKey]
     let urls = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: keys,
                                                      options: [.skipHiddenVolumes]) ?? []
-    return urls.compactMap { u in
+    var devices: [String: Device] = [:]
+    for u in urls {
         guard let v = try? u.resourceValues(forKeys: Set(keys)),
-              let total = v.volumeTotalCapacity, total > 0 else { return nil }
+              let total = v.volumeTotalCapacity, total > 0 else { continue }
         var free = v.volumeAvailableCapacityForImportantUsage ?? 0
         if free <= 0 { free = Int64(v.volumeAvailableCapacity ?? 0) }
-        return Vol(id: u, name: v.volumeName ?? u.lastPathComponent, total: Int64(total),
-                   free: free, internalDisk: v.volumeIsInternal ?? (u.path == "/"))
-    }.sorted { ($0.internalDisk ? 0 : 1, $0.name) < ($1.internalDisk ? 0 : 1, $1.name) }
+        let info = diskutilInfo(u.path)
+        let ident = info["DeviceIdentifier"] as? String ?? "?"
+        let container = (info["APFSContainerReference"] as? String) ?? (info["ParentWholeDisk"] as? String) ?? wholeDisk(ident)
+        var physical = (info["ParentWholeDisk"] as? String) ?? wholeDisk(ident)
+        if let stores = info["APFSPhysicalStores"] as? [[String: Any]],
+           let st = stores.first?["APFSPhysicalStore"] as? String { physical = wholeDisk(st) }
+        let isInternal = info["Internal"] as? Bool ?? (u.path == "/")
+        let vol = Vol(id: u, name: v.volumeName ?? u.lastPathComponent, total: Int64(total), free: free,
+                      internalDisk: isInternal, ident: ident, container: container,
+                      fs: (info["FilesystemType"] as? String ?? "").uppercased())
+        if devices[physical] == nil {
+            let d = diskutilInfo(physical)
+            var name = d["MediaName"] as? String ?? ""
+            if name.isEmpty { name = d["IORegistryEntryName"] as? String ?? physical }
+            devices[physical] = Device(id: physical, name: name,
+                size: (d["TotalSize"] as? NSNumber)?.int64Value ?? 0,
+                bus: d["BusProtocol"] as? String ?? info["BusProtocol"] as? String ?? "",
+                internalDisk: d["Internal"] as? Bool ?? isInternal,
+                solid: d["SolidState"] as? Bool ?? info["SolidState"] as? Bool, volumes: [])
+        }
+        devices[physical]!.volumes.append(vol)
+    }
+    return devices.values.map { d in var d = d; d.volumes.sort { $0.name < $1.name }; return d }
+        .sorted { ($0.internalDisk ? 0 : 1, $0.id) < ($1.internalDisk ? 0 : 1, $1.id) }
 }
 
 func dlog(_ m: String) {
@@ -61,7 +119,8 @@ func fuzzyScore(_ query: String, _ name: String) -> Int? {
 }
 
 final class Model: NSObject, ObservableObject {
-    @Published var volumes: [Vol] = []
+    @Published var devices: [Device] = []
+    var volumes: [Vol] { devices.flatMap { $0.volumes } }
     @Published var query = "" { didSet { scheduleSearch() } }
     @Published var hits: [Hit] = []
     @Published var searching = false
@@ -69,7 +128,12 @@ final class Model: NSObject, ObservableObject {
     private var proc: Process?
     private var gen = 0
 
-    func refresh() { volumes = loadVolumes() }
+    func refresh() {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let d = loadDevices()
+            DispatchQueue.main.async { self?.devices = d }
+        }
+    }
 
     private func scheduleSearch() {
         dlog("scheduleSearch q=\(query)")
@@ -124,8 +188,8 @@ struct VolRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 3) {
             HStack {
-                Image(systemName: v.internalDisk ? "internaldrive" : "externaldrive")
                 Text(v.name).fontWeight(.medium)
+                Text(v.ident).font(.caption2).foregroundColor(.secondary)
                 Spacer()
                 Text("\(gb(v.free)) free of \(gb(v.total))").font(.caption).foregroundColor(.secondary)
             }
@@ -137,12 +201,38 @@ struct VolRow: View {
     }
 }
 
+struct DeviceView: View {
+    let d: Device
+    var color: Color { d.internalDisk ? .blue : .orange }
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                Image(systemName: d.icon).font(.title2).foregroundColor(color).frame(width: 28)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(d.name).fontWeight(.semibold)
+                    Text([d.internalDisk ? "Internal" : "External", d.bus, d.kind, gb(d.size), d.id]
+                        .filter { !$0.isEmpty }.joined(separator: " · "))
+                        .font(.caption).foregroundColor(.secondary)
+                }
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(d.volumes) { VolRow(v: $0) }
+                if Set(d.volumes.map { $0.container }).count < d.volumes.count {
+                    Text("Volumes in the same APFS container share free space")
+                        .font(.caption2).foregroundColor(.secondary)
+                }
+            }
+            .padding(.leading, 36)
+        }
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var m: Model
     @FocusState private var focused: Bool
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            ForEach(m.volumes) { VolRow(v: $0) }
+            ForEach(m.devices) { DeviceView(d: $0) }
             Divider()
             HStack {
                 Image(systemName: "magnifyingglass")
@@ -158,8 +248,10 @@ struct ContentView: View {
                                 HStack {
                                     Text(h.name).fontWeight(.medium)
                                     Spacer()
-                                    Text(h.volume).font(.caption).padding(.horizontal, 6)
-                                        .background(Capsule().fill(Color.accentColor.opacity(0.2)))
+                                    let isInt = m.volumes.first { $0.name == h.volume }?.internalDisk ?? true
+                                    Label(h.volume, systemImage: isInt ? "internaldrive" : "externaldrive")
+                                        .font(.caption).padding(.horizontal, 6)
+                                        .background(Capsule().fill((isInt ? Color.blue : Color.orange).opacity(0.2)))
                                 }
                                 Text(h.path).font(.caption2).foregroundColor(.secondary)
                                     .lineLimit(1).truncationMode(.middle)

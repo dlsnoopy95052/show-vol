@@ -41,4 +41,4 @@ osascript -e 'tell application "System Events" to make login item at end with pr
 
 echo "==> Launching"
 open /Applications/ShowVol.app
-echo "Done. Look for the drive icon in the menu bar."
+echo "Done. Look for the V icon in the menu bar."

@@ -290,16 +290,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ n: Notification) {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        let vIcon = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
-            let p = NSBezierPath()
-            p.move(to: NSPoint(x: 3.5, y: 14)); p.line(to: NSPoint(x: 9, y: 4)); p.line(to: NSPoint(x: 14.5, y: 14))
-            p.lineWidth = 3; p.lineCapStyle = .round; p.lineJoinStyle = .round
-            NSColor.black.setStroke(); p.stroke()
-            return true
-        }
-        vIcon.isTemplate = true
-        vIcon.accessibilityDescription = "Volumes"
-        item.button?.image = vIcon
+        item.button?.image = NSImage(systemSymbolName: "externaldrive.fill", accessibilityDescription: "Volumes")
         item.button?.action = #selector(toggle)
         item.button?.target = self
         pop.behavior = .transient
